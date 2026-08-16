@@ -22,6 +22,10 @@ DEFAULT_CWIDTH_PCT = 3.0
 DEFAULT_MINTEST = 2
 HISTORY_TRADING_DAYS = 260
 
+# How many raw daily bars go into 1 resampled bar, per timeframe.
+TIMEFRAME_MULTIPLIER = {"Daily": 1, "Weekly": 5, "Monthly": 21}
+TIMEFRAME_RESAMPLE_RULE = {"Weekly": "W-FRI", "Monthly": "ME"}
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -101,11 +105,10 @@ def download_nse_day(dt, session):
         return False, str(e)
 
 
-def ensure_nse_history(target_date):
+def ensure_nse_history(target_date, required=HISTORY_TRADING_DAYS):
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    required = HISTORY_TRADING_DAYS
     found = 0
     checked = 0
     downloaded = 0
@@ -198,7 +201,32 @@ def load_nse_data():
     )
 
 
-def find_bullish_breakout(group, target_date, prd, bo_len, cwidth_pct, mintest):
+def resample_ohlc(group, timeframe):
+    """Resample a per-stock daily dataframe to Weekly/Monthly OHLCV bars."""
+    if timeframe == "Daily":
+        return group.reset_index(drop=True)
+
+    rule = TIMEFRAME_RESAMPLE_RULE[timeframe]
+    g = group.set_index("TradDt").sort_index()
+
+    resampled = g.resample(rule).agg({
+        "TckrSymb": "last",
+        "OpnPric": "first",
+        "HghPric": "max",
+        "LwPric": "min",
+        "ClsPric": "last",
+        "TtlTradgVol": "sum",
+    })
+    resampled = resampled.dropna(subset=["OpnPric"])
+    resampled["PrvsClsgPric"] = resampled["ClsPric"].shift(1)
+    resampled = resampled.reset_index()
+    return resampled
+
+
+def find_bullish_breakout(
+    group, target_date, prd, bo_len, cwidth_pct, mintest,
+    require_exact_date=True,
+):
     group = group.sort_values("TradDt").reset_index(drop=True).copy()
 
     n = len(group)
@@ -267,7 +295,13 @@ def find_bullish_breakout(group, target_date, prd, bo_len, cwidth_pct, mintest):
         if num < mintest or hgst >= bomax:
             continue
 
-        if group.loc[i, "TradDt"].date() == target_date:
+        is_match = (
+            group.loc[i, "TradDt"].date() == target_date
+            if require_exact_date
+            else i == n - 1
+        )
+
+        if is_match:
             close_price = float(group.loc[i, "ClsPric"])
             prev_close = float(group.loc[i, "PrvsClsgPric"])
             volume = float(group.loc[i, "TtlTradgVol"])
@@ -289,7 +323,7 @@ def find_bullish_breakout(group, target_date, prd, bo_len, cwidth_pct, mintest):
     return None
 
 
-def scan_watchlist(target_date, prd, bo_len, cwidth_pct, mintest):
+def scan_watchlist(target_date, prd, bo_len, cwidth_pct, mintest, timeframe="Daily"):
     stocklist = load_stocklist()
     data = load_nse_data()
 
@@ -303,6 +337,8 @@ def scan_watchlist(target_date, prd, bo_len, cwidth_pct, mintest):
         (data["TradDt"] <= pd.Timestamp(target_date))
     ].copy()
 
+    require_exact_date = timeframe == "Daily"
+
     results = []
     grouped = data.groupby("TckrSymb", sort=False)
 
@@ -311,8 +347,10 @@ def scan_watchlist(target_date, prd, bo_len, cwidth_pct, mintest):
     total = len(grouped)
 
     for i, (symbol, group) in enumerate(grouped, 1):
+        tf_group = resample_ohlc(group, timeframe)
         result = find_bullish_breakout(
-            group, target_date, prd, bo_len, cwidth_pct, mintest
+            tf_group, target_date, prd, bo_len, cwidth_pct, mintest,
+            require_exact_date=require_exact_date,
         )
         if result:
             results.append(result)
@@ -332,6 +370,8 @@ st.caption("TradingView Breakout Finder • Bullish Breakout only")
 
 with st.sidebar:
     st.header("⚙️ Breakout Settings")
+
+    timeframe = st.selectbox("🕒 Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
 
     prd = st.number_input("Period", 2, 50, DEFAULT_PRD)
     bo_len = st.number_input("Max B", 30, 300, DEFAULT_BO_LEN)
@@ -444,8 +484,16 @@ if get_watchlist and valid_date:
         st.error("Future date is not allowed.")
         st.stop()
 
+    # Weekly/Monthly bars each need several raw daily bars, so scale the
+    # required daily-history window accordingly (with some buffer).
+    bars_needed = int(bo_len) + (int(prd) * 2) + 20
+    required_daily_days = bars_needed * TIMEFRAME_MULTIPLIER[timeframe]
+    required_daily_days = max(required_daily_days, HISTORY_TRADING_DAYS)
+
     with st.spinner("Checking NSE data and downloading missing history..."):
-        ready, downloaded, target_exists = ensure_nse_history(selected_date)
+        ready, downloaded, target_exists = ensure_nse_history(
+            selected_date, required=required_daily_days
+        )
 
     if not target_exists:
         st.error(
@@ -464,6 +512,7 @@ if get_watchlist and valid_date:
                 int(bo_len),
                 float(cwidth_pct),
                 int(mintest),
+                timeframe=timeframe,
             )
         except Exception as e:
             st.error(f"Scanner error: {e}")
@@ -473,7 +522,7 @@ if get_watchlist and valid_date:
 
     if result.empty:
         st.warning(
-            f"No Bullish Breakout found on "
+            f"No Bullish Breakout ({timeframe}) found on "
             f"{selected_date.strftime('%d-%b-%Y')}."
         )
     else:
@@ -482,7 +531,7 @@ if get_watchlist and valid_date:
         ).reset_index(drop=True)
 
         st.success(
-            f"🟢 {len(result)} Bullish Breakout stock(s) found"
+            f"🟢 {len(result)} Bullish Breakout ({timeframe}) stock(s) found"
         )
 
         display = result[
@@ -522,7 +571,7 @@ if get_watchlist and valid_date:
             "⬇️ Download Watchlist CSV",
             csv,
             file_name=(
-                f"bullish_breakout_watchlist_"
+                f"bullish_breakout_watchlist_{timeframe.lower()}_"
                 f"{selected_date.strftime('%Y-%m-%d')}.csv"
             ),
             mime="text/csv",
