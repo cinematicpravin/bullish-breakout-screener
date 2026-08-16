@@ -22,6 +22,11 @@ DEFAULT_CWIDTH_PCT = 3.0
 DEFAULT_MINTEST = 2
 HISTORY_TRADING_DAYS = 260
 
+# NSE switched to the new UDiFF bhavcopy file format/URL on 08-Jul-2024.
+# Dates before this use a different URL + column format, so we don't
+# attempt to download them with the current nse_url() scheme.
+EARLIEST_BHAVCOPY_DATE = date(2024, 7, 8)
+
 # How many raw daily bars go into 1 resampled bar, per timeframe.
 TIMEFRAME_MULTIPLIER = {"Daily": 1, "Weekly": 5, "Monthly": 21}
 TIMEFRAME_RESAMPLE_RULE = {"Weekly": "W-FRI", "Monthly": "ME"}
@@ -112,33 +117,61 @@ def ensure_nse_history(target_date, required=HISTORY_TRADING_DAYS):
     found = 0
     checked = 0
     downloaded = 0
+    consecutive_fail = 0
     dt = target_date
 
     box = st.empty()
     bar = st.progress(0)
+    hit_floor = False
 
     while found < required and checked < required * 5:
+        if dt < EARLIEST_BHAVCOPY_DATE:
+            hit_floor = True
+            break
+
         checked += 1
         path = DATA_DIR / f"{dt.strftime('%Y%m%d')}.csv"
 
         if path.exists():
             found += 1
+            consecutive_fail = 0
         else:
             ok, status = download_nse_day(dt, session)
             if ok:
                 found += 1
+                consecutive_fail = 0
                 if status == "downloaded":
                     downloaded += 1
+            else:
+                consecutive_fail += 1
 
         bar.progress(min(found / required, 1.0))
         box.write(
             f"NSE history: {found}/{required} trading days ready • "
             f"checking {dt.strftime('%d-%b-%Y')}"
         )
+
+        # Safety net: many failures in a row (e.g. weekends/holidays are
+        # normal and skipped quickly, but a long unbroken failure streak
+        # usually means we've wandered into a date range with no usable
+        # data) — stop instead of grinding through thousands of dead
+        # network requests.
+        if consecutive_fail >= 15:
+            break
+
         dt -= timedelta(days=1)
 
     box.empty()
     bar.empty()
+
+    if hit_floor:
+        st.info(
+            f"NSE bhavcopy is only available from "
+            f"{EARLIEST_BHAVCOPY_DATE.strftime('%d-%b-%Y')} onward with this "
+            f"data source (NSE changed file format before that). Got "
+            f"{found} trading day(s) of history — reduce 'Max B' if you "
+            f"need results with this much history."
+        )
 
     target_exists = (
         DATA_DIR / f"{target_date.strftime('%Y%m%d')}.csv"
@@ -489,6 +522,21 @@ if get_watchlist and valid_date:
     bars_needed = int(bo_len) + (int(prd) * 2) + 20
     required_daily_days = bars_needed * TIMEFRAME_MULTIPLIER[timeframe]
     required_daily_days = max(required_daily_days, HISTORY_TRADING_DAYS)
+
+    max_available_days = (selected_date - EARLIEST_BHAVCOPY_DATE).days
+    if required_daily_days > max_available_days > 0:
+        max_bars_possible = max(
+            (max_available_days // TIMEFRAME_MULTIPLIER[timeframe])
+            - (int(prd) * 2) - 20,
+            0,
+        )
+        st.warning(
+            f"⚠️ NSE bhavcopy (this data source) is only available from "
+            f"{EARLIEST_BHAVCOPY_DATE.strftime('%d-%b-%Y')} onward. With "
+            f"{timeframe} timeframe that's roughly **{max_bars_possible} "
+            f"bars max** — your 'Max B' of {bo_len} won't be fully met. "
+            f"Lower 'Max B' for reliable results."
+        )
 
     with st.spinner("Checking NSE data and downloading missing history..."):
         ready, downloaded, target_exists = ensure_nse_history(
