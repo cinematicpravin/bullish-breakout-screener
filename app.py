@@ -102,7 +102,15 @@ def download_nse_day(dt, session):
     target = DATA_DIR / f"{dt.strftime('%Y%m%d')}.csv"
 
     if target.exists():
-        return True, "cached"
+        # Guard against files cached before a data-source change (e.g. the
+        # old CM-UDiFF schema) — don't trust a same-named file blindly.
+        try:
+            head = target.read_text(encoding="utf-8", errors="ignore")[:200]
+        except Exception:
+            head = ""
+        if "SYMBOL" in head:
+            return True, "cached"
+        target.unlink(missing_ok=True)
 
     try:
         r = session.get(nse_url(dt), timeout=30)
