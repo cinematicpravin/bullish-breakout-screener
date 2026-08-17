@@ -22,10 +22,10 @@ DEFAULT_CWIDTH_PCT = 3.0
 DEFAULT_MINTEST = 2
 HISTORY_TRADING_DAYS = 260
 
-# NSE switched to the new UDiFF bhavcopy file format/URL on 08-Jul-2024.
-# Dates before this use a different URL + column format, so we don't
-# attempt to download them with the current nse_url() scheme.
-EARLIEST_BHAVCOPY_DATE = date(2024, 7, 8)
+# sec_bhavdata_full report (with delivery data) has been continuously
+# published by NSE since 01-Jan-2016 — unlike the newer CM-UDiFF bhavcopy,
+# it wasn't affected by the Jul-2024 format change.
+EARLIEST_BHAVCOPY_DATE = date(2016, 1, 1)
 
 # How many raw daily bars go into 1 resampled bar, per timeframe.
 TIMEFRAME_MULTIPLIER = {"Daily": 1, "Weekly": 5, "Monthly": 21}
@@ -92,8 +92,8 @@ def next_trading_day(d):
 
 def nse_url(dt):
     return (
-        "https://nsearchives.nseindia.com/content/cm/"
-        f"BhavCopy_NSE_CM_0_0_0_{dt.strftime('%Y%m%d')}_F_0000.csv.zip"
+        "https://nsearchives.nseindia.com/products/content/"
+        f"sec_bhavdata_full_{dt.strftime('%d%m%Y')}.csv"
     )
 
 
@@ -108,13 +108,10 @@ def download_nse_day(dt, session):
         r = session.get(nse_url(dt), timeout=30)
         if r.status_code != 200:
             return False, f"HTTP {r.status_code}"
+        if not r.content or b"SYMBOL" not in r.content[:2000]:
+            return False, "unexpected content"
 
-        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-            csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
-            if not csvs:
-                return False, "CSV not found in ZIP"
-            target.write_bytes(z.read(csvs[0]))
-
+        target.write_bytes(r.content)
         return True, "downloaded"
     except Exception as e:
         return False, str(e)
@@ -176,9 +173,8 @@ def ensure_nse_history(target_date, required=HISTORY_TRADING_DAYS):
 
     if hit_floor:
         st.info(
-            f"NSE bhavcopy is only available from "
-            f"{EARLIEST_BHAVCOPY_DATE.strftime('%d-%b-%Y')} onward with this "
-            f"data source (NSE changed file format before that). Got "
+            f"NSE bhavcopy (this data source) only goes back to "
+            f"{EARLIEST_BHAVCOPY_DATE.strftime('%d-%b-%Y')}. Got "
             f"{found} trading day(s) of history — reduce 'Max B' if you "
             f"need results with this much history."
         )
@@ -197,26 +193,44 @@ def load_nse_data():
     for file in sorted(DATA_DIR.glob("*.csv")):
         try:
             df = pd.read_csv(file, low_memory=False)
+            df.columns = df.columns.str.strip()
 
             required = {
-                "TradDt", "TckrSymb", "FinInstrmTp", "SctySrs",
-                "OpnPric", "HghPric", "LwPric", "ClsPric",
-                "PrvsClsgPric", "TtlTradgVol",
+                "SYMBOL", "SERIES", "DATE1", "PREV_CLOSE",
+                "OPEN_PRICE", "HIGH_PRICE", "LOW_PRICE", "CLOSE_PRICE",
+                "TTL_TRD_QNTY",
             }
 
             if not required.issubset(df.columns):
                 continue
 
+            # Source CSV has a leading space after every comma, so
+            # string columns come in as " EQ", " 20MICRONS", etc.
+            for col in ["SYMBOL", "SERIES", "DATE1"]:
+                df[col] = df[col].astype(str).str.strip()
+
             df = df[
-                (df["FinInstrmTp"] == "STK") &
-                (df["SctySrs"].isin(["EQ", "BE", "BZ", "SM", "ST", "SZ"]))
+                df["SERIES"].isin(["EQ", "BE", "BZ", "SM", "ST", "SZ"])
             ].copy()
 
-            df["TckrSymb"] = (
-                df["TckrSymb"].astype(str).str.strip().str.upper()
-            )
+            df["SYMBOL"] = df["SYMBOL"].str.upper()
 
-            frames.append(df[list(required)])
+            df = df.rename(columns={
+                "SYMBOL": "TckrSymb",
+                "DATE1": "TradDt",
+                "PREV_CLOSE": "PrvsClsgPric",
+                "OPEN_PRICE": "OpnPric",
+                "HIGH_PRICE": "HghPric",
+                "LOW_PRICE": "LwPric",
+                "CLOSE_PRICE": "ClsPric",
+                "TTL_TRD_QNTY": "TtlTradgVol",
+            })
+
+            keep_cols = [
+                "TradDt", "TckrSymb", "OpnPric", "HghPric", "LwPric",
+                "ClsPric", "PrvsClsgPric", "TtlTradgVol",
+            ]
+            frames.append(df[keep_cols])
 
         except Exception:
             continue
@@ -226,7 +240,9 @@ def load_nse_data():
 
     data = pd.concat(frames, ignore_index=True)
 
-    data["TradDt"] = pd.to_datetime(data["TradDt"], errors="coerce")
+    data["TradDt"] = pd.to_datetime(
+        data["TradDt"], format="%d-%b-%Y", errors="coerce"
+    )
 
     for col in [
         "OpnPric", "HghPric", "LwPric", "ClsPric",
