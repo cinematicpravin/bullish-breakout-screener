@@ -421,6 +421,26 @@ with st.sidebar:
             f"**{max(dates).strftime('%d-%b-%Y')}**"
         )
 
+        def _build_cache_zip():
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for f in sorted(DATA_DIR.glob("*.csv")):
+                    z.write(f, arcname=f.name)
+            buf.seek(0)
+            return buf.getvalue()
+
+        st.download_button(
+            "⬇️ Download Cached Data (ZIP)",
+            _build_cache_zip(),
+            file_name=f"nse_bhavcopy_cache_{date.today().strftime('%Y%m%d')}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            help=(
+                "Streamlit Cloud storage is temporary — download this "
+                "before the app sleeps/restarts if you want to keep it."
+            ),
+        )
+
 today = date.today()
 
 if "date_text_input" not in st.session_state:
