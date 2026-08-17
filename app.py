@@ -407,7 +407,7 @@ with st.sidebar:
     timeframe = st.selectbox("🕒 Timeframe", ["Daily", "Weekly", "Monthly"], index=0)
 
     prd = st.number_input("Period", 2, 50, DEFAULT_PRD)
-    bo_len = st.number_input("Max B", 30, 300, DEFAULT_BO_LEN)
+    bo_len = st.number_input("Max B", 5, 300, DEFAULT_BO_LEN)
     cwidth_pct = st.number_input("Thre. %", 1.0, 10.0, DEFAULT_CWIDTH_PCT, step=0.1)
     mintest = st.number_input("Min Tests", 1, 20, DEFAULT_MINTEST)
 
