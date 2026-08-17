@@ -44,6 +44,16 @@ HEADERS = {
 
 
 @st.cache_data
+def build_cache_zip(_dates_signature):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(DATA_DIR.glob("*.csv")):
+            z.write(f, arcname=f.name)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@st.cache_data
 def load_stocklist():
     if not STOCKLIST_FILE.exists():
         return set()
@@ -421,17 +431,9 @@ with st.sidebar:
             f"**{max(dates).strftime('%d-%b-%Y')}**"
         )
 
-        def _build_cache_zip():
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-                for f in sorted(DATA_DIR.glob("*.csv")):
-                    z.write(f, arcname=f.name)
-            buf.seek(0)
-            return buf.getvalue()
-
         st.download_button(
             "⬇️ Download Cached Data (ZIP)",
-            _build_cache_zip(),
+            build_cache_zip(tuple(dates)),
             file_name=f"nse_bhavcopy_cache_{date.today().strftime('%Y%m%d')}.zip",
             mime="application/zip",
             use_container_width=True,
@@ -539,24 +541,39 @@ if get_watchlist and valid_date:
 
     # Weekly/Monthly bars each need several raw daily bars, so scale the
     # required daily-history window accordingly (with some buffer).
-    bars_needed = int(bo_len) + (int(prd) * 2) + 20
+    buffer_bars = 5 if timeframe != "Daily" else 20
+    bars_needed = int(bo_len) + (int(prd) * 2) + buffer_bars
     required_daily_days = bars_needed * TIMEFRAME_MULTIPLIER[timeframe]
     required_daily_days = max(required_daily_days, HISTORY_TRADING_DAYS)
 
-    max_available_days = (selected_date - EARLIEST_BHAVCOPY_DATE).days
-    if required_daily_days > max_available_days > 0:
+    # Accurate periods-available estimate (calendar-based, not a days/
+    # multiplier approximation which under-counts).
+    if timeframe == "Weekly":
+        periods_available = (
+            (selected_date - EARLIEST_BHAVCOPY_DATE).days // 7
+        )
+    elif timeframe == "Monthly":
+        periods_available = (
+            (selected_date.year - EARLIEST_BHAVCOPY_DATE.year) * 12
+            + (selected_date.month - EARLIEST_BHAVCOPY_DATE.month)
+            + 1
+        )
+    else:
+        periods_available = None
+
+    if periods_available is not None:
         max_bars_possible = max(
-            (max_available_days // TIMEFRAME_MULTIPLIER[timeframe])
-            - (int(prd) * 2) - 20,
-            0,
+            periods_available - (int(prd) * 2) - 5, 0
         )
-        st.warning(
-            f"⚠️ NSE bhavcopy (this data source) is only available from "
-            f"{EARLIEST_BHAVCOPY_DATE.strftime('%d-%b-%Y')} onward. With "
-            f"{timeframe} timeframe that's roughly **{max_bars_possible} "
-            f"bars max** — your 'Max B' of {bo_len} won't be fully met. "
-            f"Lower 'Max B' for reliable results."
-        )
+        if int(bo_len) > max_bars_possible:
+            st.warning(
+                f"⚠️ NSE bhavcopy (this data source) is only available from "
+                f"{EARLIEST_BHAVCOPY_DATE.strftime('%d-%b-%Y')} onward — "
+                f"~{periods_available} {timeframe.lower()} bars exist total. "
+                f"With Period={prd}, 'Max B' can realistically go up to "
+                f"~**{max_bars_possible}**. Your Max B of {bo_len} won't be "
+                f"fully met; lower it for reliable results."
+            )
 
     with st.spinner("Checking NSE data and downloading missing history..."):
         ready, downloaded, target_exists = ensure_nse_history(
